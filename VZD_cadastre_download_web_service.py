@@ -826,7 +826,7 @@ if res_map:
             elapsed_time = round(time.time() - start_time, 1)
             
             if final_data:
-                update_counter()
+                st.session_state["total_downloads"] = update_counter()
                 st.success(f"Shapefile Data processed successfully in {elapsed_time} seconds!")
                 
                 summary_data = [{"Layer": l, "Total Polygons": c} for l, c in counts.items() if c > 0]
@@ -854,7 +854,7 @@ if res_map:
             elapsed_time = round(time.time() - start_time, 1)
             
             if excel_data:
-                update_counter()
+                st.session_state["total_downloads"] = update_counter()
                 st.success(f"Excel File Built Successfully in {elapsed_time} seconds!")
                 
                 st.table(pd.DataFrame([
@@ -883,7 +883,7 @@ if res_map:
             elapsed_time = round(time.time() - start_time, 1)
             
             if final_data:
-                update_counter()
+                st.session_state["total_downloads"] = update_counter()
                 st.success(f"Preregistered Buildings processed successfully in {elapsed_time} seconds!")
                 
                 summary_data = [{"Layer": l, "Total Polygons": c} for l, c in counts.items() if c > 0]
@@ -939,5 +939,8 @@ if res_map:
 
 # --- Render Footer Counter at the absolute bottom ---
 st.divider()
-final_count = get_counter()
-st.markdown(f'<div class="counter-container"><div class="counter-box">📥 Total Downloads: {final_count}</div></div>', unsafe_allow_html=True)
+
+if "total_downloads" not in st.session_state:
+    st.session_state["total_downloads"] = get_counter()
+
+st.markdown(f'<div class="counter-container"><div class="counter-box">📥 Total Downloads: {st.session_state["total_downloads"]}</div></div>', unsafe_allow_html=True)
