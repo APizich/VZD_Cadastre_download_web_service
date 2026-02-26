@@ -12,6 +12,7 @@ import pandas as pd
 import time
 import gc
 import re
+import json
 
 # --- Configuration & SSL Setup ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -22,7 +23,6 @@ DATASET_ID = "kadastra-informacijas-sistemas-atverti-telpiskie-dati"
 TEXT_DATASET_ID = "kadastra-informacijas-sistemas-atvertie-dati"
 CKAN_API_URL = f"https://data.gov.lv/dati/lv/api/3/action/package_show?id={DATASET_ID}"
 TEXT_API_URL = f"https://data.gov.lv/dati/lv/api/3/action/package_show?id={TEXT_DATASET_ID}"
-COUNTER_FILE = "download_stats.txt"
 
 # --- HARDCODED ATVK MAP ---
 ATVK_MAP = {
@@ -144,23 +144,46 @@ def get_target_atvks(sel_names):
             debug_info.append(f"❌ '{name}' -> Cleaned: '{clean_name}' -> Not in Code Map")
     return target_codes, debug_info
 
-def update_counter():
-    count = 0
-    if os.path.exists(COUNTER_FILE):
-        with open(COUNTER_FILE, "r") as f:
-            try: count = int(f.read().strip())
-            except: pass
-    count += 1
-    with open(COUNTER_FILE, "w") as f:
-        f.write(str(count))
-    return count
+# --- GitHub Gist Counter Setup ---
+try:
+    GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
+    GIST_ID = st.secrets["GIST_ID"]
+    GIST_URL = f"https://api.github.com/gists/{GIST_ID}"
+    GIST_HEADERS = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+except Exception as e:
+    GIST_URL = None
+    GIST_HEADERS = None
 
 def get_counter():
-    if os.path.exists(COUNTER_FILE):
-        with open(COUNTER_FILE, "r") as f:
-            try: return int(f.read().strip())
-            except: return 0
+    if not GIST_URL: return 0
+    try:
+        response = requests.get(GIST_URL, headers=GIST_HEADERS, timeout=5)
+        if response.status_code == 200:
+            gist_data = response.json()
+            content = gist_data["files"]["counter.json"]["content"]
+            return json.loads(content).get("count", 0)
+    except: pass
     return 0
+
+def update_counter():
+    if not GIST_URL: return 1
+    current_count = get_counter()
+    new_count = current_count + 1
+    
+    payload = {
+        "files": {
+            "counter.json": {
+                "content": json.dumps({"count": new_count})
+            }
+        }
+    }
+    try:
+        requests.patch(GIST_URL, headers=GIST_HEADERS, json=payload, timeout=5)
+    except: pass
+    return new_count
 
 @st.cache_data
 def get_territory_list():
@@ -619,9 +642,12 @@ def process_territories(sel_names, res_map, sel_types, txt_urls, join_text, sele
         return None, counts
     finally:
         gc.collect() 
-        for _ in range(3):
-            try: shutil.rmtree(tmp_dir); break
-            except: time.sleep(1.0)
+        for _ in range(5):
+            try: 
+                shutil.rmtree(tmp_dir)
+                break
+            except: 
+                time.sleep(0.2)
     return None, counts
 
 def process_excel_export(sel_names, txt_urls):
@@ -725,9 +751,12 @@ def process_excel_export(sel_names, txt_urls):
         return None, 0, 0
     finally:
         gc.collect() 
-        for _ in range(3):
-            try: shutil.rmtree(tmp_dir); break
-            except: time.sleep(1.0)
+        for _ in range(5):
+            try: 
+                shutil.rmtree(tmp_dir)
+                break
+            except: 
+                time.sleep(0.2)
 
 
 # --- Main App Interface ---
@@ -797,13 +826,16 @@ if res_map:
             elapsed_time = round(time.time() - start_time, 1)
             
             if final_data:
-                update_counter()
+                # API UPDATE NOW HAPPENS HERE, HIDDEN BEHIND THE SCENES
+                st.session_state["total_downloads"] = update_counter()
+                
                 st.success(f"Shapefile Data processed successfully in {elapsed_time} seconds!")
                 
                 summary_data = [{"Layer": l, "Total Polygons": c} for l, c in counts.items() if c > 0]
                 if summary_data:
                     st.table(pd.DataFrame(summary_data))
 
+                # PURE NATIVE DOWNLOAD - ZERO CALLBACKS
                 st.download_button(
                     label="📥 Download Merged Shapefiles (.zip)",
                     data=final_data,
@@ -825,7 +857,9 @@ if res_map:
             elapsed_time = round(time.time() - start_time, 1)
             
             if excel_data:
-                update_counter()
+                # API UPDATE NOW HAPPENS HERE, HIDDEN BEHIND THE SCENES
+                st.session_state["total_downloads"] = update_counter()
+                
                 st.success(f"Excel File Built Successfully in {elapsed_time} seconds!")
                 
                 st.table(pd.DataFrame([
@@ -833,6 +867,7 @@ if res_map:
                     {"Sheet": "Buildings", "Total Records": b_count}
                 ]))
                 
+                # PURE NATIVE DOWNLOAD - ZERO CALLBACKS
                 st.download_button(
                     label="📥 Download Property_Owners.xlsx",
                     data=excel_data,
@@ -854,13 +889,16 @@ if res_map:
             elapsed_time = round(time.time() - start_time, 1)
             
             if final_data:
-                update_counter()
+                # API UPDATE NOW HAPPENS HERE, HIDDEN BEHIND THE SCENES
+                st.session_state["total_downloads"] = update_counter()
+                
                 st.success(f"Preregistered Buildings processed successfully in {elapsed_time} seconds!")
                 
                 summary_data = [{"Layer": l, "Total Polygons": c} for l, c in counts.items() if c > 0]
                 if summary_data:
                     st.table(pd.DataFrame(summary_data))
 
+                # PURE NATIVE DOWNLOAD - ZERO CALLBACKS
                 st.download_button(
                     label="📥 Download Prereg_buildings.zip",
                     data=final_data,
@@ -910,5 +948,8 @@ if res_map:
 
 # --- Render Footer Counter at the absolute bottom ---
 st.divider()
-final_count = get_counter()
-st.markdown(f'<div class="counter-container"><div class="counter-box">📥 Total Downloads: {final_count}</div></div>', unsafe_allow_html=True)
+
+if "total_downloads" not in st.session_state:
+    st.session_state["total_downloads"] = get_counter()
+
+st.markdown(f'<div class="counter-container"><div class="counter-box">📥 Total Generated: {st.session_state["total_downloads"]}</div></div>', unsafe_allow_html=True)
