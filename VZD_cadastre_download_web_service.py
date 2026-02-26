@@ -12,6 +12,7 @@ import pandas as pd
 import time
 import gc
 import re
+import json
 
 # --- Configuration & SSL Setup ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -22,7 +23,6 @@ DATASET_ID = "kadastra-informacijas-sistemas-atverti-telpiskie-dati"
 TEXT_DATASET_ID = "kadastra-informacijas-sistemas-atvertie-dati"
 CKAN_API_URL = f"https://data.gov.lv/dati/lv/api/3/action/package_show?id={DATASET_ID}"
 TEXT_API_URL = f"https://data.gov.lv/dati/lv/api/3/action/package_show?id={TEXT_DATASET_ID}"
-COUNTER_FILE = "download_stats.txt"
 
 # --- HARDCODED ATVK MAP ---
 ATVK_MAP = {
@@ -144,23 +144,52 @@ def get_target_atvks(sel_names):
             debug_info.append(f"❌ '{name}' -> Cleaned: '{clean_name}' -> Not in Code Map")
     return target_codes, debug_info
 
-def update_counter():
-    count = 0
-    if os.path.exists(COUNTER_FILE):
-        with open(COUNTER_FILE, "r") as f:
-            try: count = int(f.read().strip())
-            except: pass
-    count += 1
-    with open(COUNTER_FILE, "w") as f:
-        f.write(str(count))
-    return count
+# --- GitHub Gist Counter Setup ---
+# Pulling secure keys from Streamlit Secrets (use a try/except so local testing doesn't crash)
+try:
+    GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
+    GIST_ID = st.secrets["GIST_ID"]
+    GIST_URL = f"https://api.github.com/gists/{GIST_ID}"
+    GIST_HEADERS = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+except Exception as e:
+    GIST_URL = None
+    GIST_HEADERS = None
+    print("Secrets not found. Counter will remain at 0 during local testing.")
 
 def get_counter():
-    if os.path.exists(COUNTER_FILE):
-        with open(COUNTER_FILE, "r") as f:
-            try: return int(f.read().strip())
-            except: return 0
+    if not GIST_URL: return 0
+    try:
+        response = requests.get(GIST_URL, headers=GIST_HEADERS)
+        if response.status_code == 200:
+            gist_data = response.json()
+            content = gist_data["files"]["counter.json"]["content"]
+            return json.loads(content).get("count", 0)
+    except Exception as e:
+        print(f"Error reading counter: {e}")
     return 0
+
+def update_counter():
+    if not GIST_URL: return 1
+    current_count = get_counter()
+    new_count = current_count + 1
+    
+    payload = {
+        "files": {
+            "counter.json": {
+                "content": json.dumps({"count": new_count})
+            }
+        }
+    }
+    
+    try:
+        requests.patch(GIST_URL, headers=GIST_HEADERS, json=payload)
+    except Exception as e:
+        print(f"Error updating counter: {e}")
+        
+    return new_count
 
 @st.cache_data
 def get_territory_list():
