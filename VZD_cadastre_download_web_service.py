@@ -191,6 +191,9 @@ def update_counter():
         
     return new_count
 
+def increment_counter():
+    st.session_state["total_downloads"] = update_counter()
+
 @st.cache_data
 def get_territory_list():
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -648,9 +651,12 @@ def process_territories(sel_names, res_map, sel_types, txt_urls, join_text, sele
         return None, counts
     finally:
         gc.collect() 
-        for _ in range(3):
-            try: shutil.rmtree(tmp_dir); break
-            except: time.sleep(1.0)
+        for _ in range(5):
+            try: 
+                shutil.rmtree(tmp_dir)
+                break
+            except: 
+                time.sleep(0.2)
     return None, counts
 
 def process_excel_export(sel_names, txt_urls):
@@ -754,9 +760,12 @@ def process_excel_export(sel_names, txt_urls):
         return None, 0, 0
     finally:
         gc.collect() 
-        for _ in range(3):
-            try: shutil.rmtree(tmp_dir); break
-            except: time.sleep(1.0)
+        for _ in range(5):
+            try: 
+                shutil.rmtree(tmp_dir)
+                break
+            except: 
+                time.sleep(0.2)
 
 
 # --- Main App Interface ---
@@ -826,7 +835,6 @@ if res_map:
             elapsed_time = round(time.time() - start_time, 1)
             
             if final_data:
-                st.session_state["total_downloads"] = update_counter()
                 st.success(f"Shapefile Data processed successfully in {elapsed_time} seconds!")
                 
                 summary_data = [{"Layer": l, "Total Polygons": c} for l, c in counts.items() if c > 0]
@@ -837,7 +845,8 @@ if res_map:
                     label="📥 Download Merged Shapefiles (.zip)",
                     data=final_data,
                     file_name="cadastre_merged.zip",
-                    mime="application/zip"
+                    mime="application/zip",
+                    on_click=increment_counter
                 )
 
     with tab2:
@@ -854,7 +863,6 @@ if res_map:
             elapsed_time = round(time.time() - start_time, 1)
             
             if excel_data:
-                st.session_state["total_downloads"] = update_counter()
                 st.success(f"Excel File Built Successfully in {elapsed_time} seconds!")
                 
                 st.table(pd.DataFrame([
@@ -866,7 +874,8 @@ if res_map:
                     label="📥 Download Property_Owners.xlsx",
                     data=excel_data,
                     file_name="Property_Owners.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    on_click=increment_counter
                 )
 
     with tab3:
@@ -883,7 +892,6 @@ if res_map:
             elapsed_time = round(time.time() - start_time, 1)
             
             if final_data:
-                st.session_state["total_downloads"] = update_counter()
                 st.success(f"Preregistered Buildings processed successfully in {elapsed_time} seconds!")
                 
                 summary_data = [{"Layer": l, "Total Polygons": c} for l, c in counts.items() if c > 0]
@@ -894,7 +902,8 @@ if res_map:
                     label="📥 Download Prereg_buildings.zip",
                     data=final_data,
                     file_name="Prereg_buildings.zip",
-                    mime="application/zip"
+                    mime="application/zip",
+                    on_click=increment_counter
                 )
 
     with st.expander("ℹ️ Field Metadata"):
