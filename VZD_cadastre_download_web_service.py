@@ -469,9 +469,11 @@ def merge_files(file_paths, out_path, land_map, build_map, addr_map, prop_map, n
             try:
                 with shapefile.Reader(path, encoding="utf-8") as sf:
                     if len(sf.fields) != len(reference_fields): continue
-                    for sr in sf.iterShapeRecords():
-                        cid = normalize_id(sr.record[kad_idx]) if kad_idx != -1 else ""
-                        row_data = list(sr.record)
+                    
+                    # CHANGE: Use iterRecords() to read only attributes first
+                    for i, record in enumerate(sf.iterRecords()):
+                        cid = normalize_id(record[kad_idx]) if kad_idx != -1 else ""
+                        row_data = list(record)
                         
                         b_data = build_map.get(cid, {}) if not is_parcel else {}
                         
@@ -525,7 +527,9 @@ def merge_files(file_paths, out_path, land_map, build_map, addr_map, prop_map, n
                             row_data.append(val)
                         
                         w.record(*row_data)
-                        w.shape(sr.shape)
+                        
+                        # CHANGE: Only read geometry if the record passed the checks above
+                        w.shape(sf.shape(i))
                         count += 1
             except: continue
             
@@ -885,7 +889,10 @@ if res_map:
         
         if st.button("🏗️ Generate Preregistered Buildings", type="primary", key="prereg_btn", disabled=btn3_disabled):
             start_time = time.time()
-            final_data, counts = process_territories(sel, res_map, ["KKBuilding"], txt_urls, False, [], prereg_mode=True)
+            
+            # CHANGE: Passed True for join_text and ['BUI_NAME'] to ensure building XML is downloaded!
+            final_data, counts = process_territories(sel, res_map, ["KKBuilding"], txt_urls, True, ['BUI_NAME'], prereg_mode=True)
+            
             elapsed_time = round(time.time() - start_time, 1)
             
             if final_data:
