@@ -13,6 +13,7 @@ import time
 import gc
 import re
 import json
+import sqlite3
 
 # --- Configuration & SSL Setup ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -55,7 +56,6 @@ st.markdown("""
         color: white; 
         font-weight: bold; 
     }
-    /* Disabled button styling override to make it clear it's not clickable */
     .stButton>button:disabled {
         background-color: #cccccc !important;
         color: #666666 !important;
@@ -79,7 +79,6 @@ st.markdown("""
     div[data-baseweb="select"] span[data-baseweb="tag"] { max-width: 100% !important; white-space: normal !important; height: auto !important; }
     div[data-baseweb="select"] span[data-baseweb="tag"] span { white-space: normal !important; word-break: break-word !important; }
     
-    /* Updated Counter CSS */
     .counter-container { 
         display: flex; 
         justify-content: flex-end; 
@@ -88,7 +87,7 @@ st.markdown("""
         margin-bottom: 10px;
     }
     .counter-box { 
-        background-color: #e2e8f0; /* Greyish */
+        background-color: #e2e8f0; 
         color: #475569; 
         padding: 10px 20px; 
         border-radius: 8px; 
@@ -124,6 +123,28 @@ FIELD_CONFIG = {
     }
 }
 
+# --- DB Helper Functions ---
+def get_db_conn(db_path):
+    conn = sqlite3.connect(db_path)
+    # Extremely aggressive performance PRAGMAs (safe because it's a temp DB)
+    conn.execute("PRAGMA synchronous = OFF")
+    conn.execute("PRAGMA journal_mode = MEMORY")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA locking_mode = EXCLUSIVE")
+
+    conn.execute("CREATE TABLE IF NOT EXISTS addresses (cid TEXT PRIMARY KEY, address TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS land (cid TEXT PRIMARY KEY, atvk TEXT, par_area REAL, purl_max TEXT, p_area_max REAL, purl_lst TEXT, p_area_lst TEXT, liz_qual REAL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS buildings (cid TEXT PRIMARY KEY, prereg TEXT, bui_name TEXT, glv TEXT, glv_name TEXT, bui_area REAL, floors INTEGER, u_floors INTEGER, pg_count INTEGER, eug TEXT, nol TEXT, not_exist TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS properties (cid TEXT, pro_cad_nr TEXT, pro_name TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS ownership (cid TEXT, status TEXT, person TEXT)")
+    conn.commit()
+    return conn
+
+def index_db(conn):
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_prop_cid ON properties(cid)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_own_cid ON ownership(cid)")
+    conn.commit()
+
 # --- Helper Functions ---
 def get_target_atvks(sel_names):
     target_codes = set()
@@ -144,7 +165,6 @@ def get_target_atvks(sel_names):
             debug_info.append(f"❌ '{name}' -> Cleaned: '{clean_name}' -> Not in Code Map")
     return target_codes, debug_info
 
-# --- GitHub Gist Counter Setup ---
 try:
     GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
     GIST_ID = st.secrets["GIST_ID"]
@@ -236,7 +256,7 @@ def find_text(elem, suffix, default=""):
     child = find_child(elem, suffix)
     return child.text.strip() if child is not None and child.text else default
 
-# --- XML Parsing Functions ---
+# --- XML Parsing Functions (Now mapped to SQLite) ---
 def format_lv_address(elem):
     parts = []
     street = (elem.findtext("Street") or "").strip()
@@ -260,8 +280,8 @@ def format_lv_address(elem):
         parts.append(p_idx)
     return ", ".join(parts)
 
-def parse_address_xml(xml_path):
-    addr_map = {}
+def parse_address_xml(xml_path, conn):
+    batch = []
     try:
         context = ET.iterparse(xml_path, events=("end",))
         for event, elem in context:
@@ -271,13 +291,18 @@ def parse_address_xml(xml_path):
                     cad_nr = rel.findtext("ObjectCadastreNr")
                     addr_data = elem.find("AddressData")
                     if cad_nr and addr_data is not None:
-                        addr_map[normalize_id(cad_nr)] = format_lv_address(addr_data)
+                        batch.append((normalize_id(cad_nr), format_lv_address(addr_data)))
                 elem.clear()
+                if len(batch) >= 10000:
+                    conn.executemany("INSERT OR REPLACE INTO addresses (cid, address) VALUES (?, ?)", batch)
+                    batch = []
+        if batch:
+            conn.executemany("INSERT OR REPLACE INTO addresses (cid, address) VALUES (?, ?)", batch)
+        conn.commit()
     except: pass
-    return addr_map
 
-def parse_land_xml(xml_path):
-    data_map = {}
+def parse_land_xml(xml_path, conn):
+    batch = []
     try:
         context = ET.iterparse(xml_path, events=("end",))
         for event, elem in context:
@@ -296,21 +321,27 @@ def parse_land_xml(xml_path):
                                 area = float(p_data.findtext("LandPurposeArea") or 0.0)
                                 purposes.append((code, area))
                         purposes.sort(key=lambda x: (-x[1], x[0]))
-                        data_map[cid] = {
-                            'ATVK': (basic.findtext("ATVKCode") or "").strip(),
-                            'PAR_AREA': float(basic.findtext("ParcelArea") or 0.0),
-                            'PURL_MAX': purposes[0][0] if purposes else "",
-                            'P_AREA_MAX': purposes[0][1] if purposes else 0.0,
-                            'PURL_LST': ";".join([p[0] for p in purposes]),
-                            'P_AREA_LST': ";".join([str(int(p[1])) for p in purposes]),
-                            'LIZ_QUAL': float(basic.findtext("ParcelLizValue") or 0.0)
-                        }
+                        batch.append((
+                            cid,
+                            (basic.findtext("ATVKCode") or "").strip(),
+                            float(basic.findtext("ParcelArea") or 0.0),
+                            purposes[0][0] if purposes else "",
+                            purposes[0][1] if purposes else 0.0,
+                            ";".join([p[0] for p in purposes]),
+                            ";".join([str(int(p[1])) for p in purposes]),
+                            float(basic.findtext("ParcelLizValue") or 0.0)
+                        ))
                 elem.clear()
+                if len(batch) >= 10000:
+                    conn.executemany("INSERT OR REPLACE INTO land (cid, atvk, par_area, purl_max, p_area_max, purl_lst, p_area_lst, liz_qual) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", batch)
+                    batch = []
+        if batch:
+            conn.executemany("INSERT OR REPLACE INTO land (cid, atvk, par_area, purl_max, p_area_max, purl_lst, p_area_lst, liz_qual) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", batch)
+        conn.commit()
     except: pass
-    return data_map
 
-def parse_building_xml(xml_path):
-    data_map = {}
+def parse_building_xml(xml_path, conn):
+    batch = []
     try:
         context = ET.iterparse(xml_path, events=("end",))
         for event, elem in context:
@@ -329,26 +360,27 @@ def parse_building_xml(xml_path):
                         use_kind = find_child(basic, "BuildingUseKind")
                         glv = find_text(use_kind, "BuildingUseKindId") if use_kind is not None else ""
                         glv_name = find_text(use_kind, "BuildingUseKindName") if use_kind is not None else ""
-                        data_map[cid] = {
-                            'Prereg': find_text(basic, "Prereg"), 
-                            'BUI_NAME': find_text(basic, "BuildingName"),
-                            'GLV': glv,
-                            'GLV_NAME': glv_name,
-                            'BUI_AREA': parse_float(find_text(basic, "BuildingArea")),
-                            'FLOORS': parse_int(find_text(basic, "BuildingGroundFloors")),
-                            'U_FLOORS': parse_int(find_text(basic, "BuildingUndergroundFloors")),
-                            'PG_COUNT': parse_int(find_text(basic, "BuildingPregCount")),
-                            'EUG': find_text(basic, "BuildingExploitYear"),
-                            'NOL': find_text(basic, "BuildingDeprecation"),
-                            'NOT_EXIST': find_text(basic, "NotExist")
-                        }
+                        batch.append((
+                            cid, find_text(basic, "Prereg"), find_text(basic, "BuildingName"),
+                            glv, glv_name, parse_float(find_text(basic, "BuildingArea")),
+                            parse_int(find_text(basic, "BuildingGroundFloors")),
+                            parse_int(find_text(basic, "BuildingUndergroundFloors")),
+                            parse_int(find_text(basic, "BuildingPregCount")),
+                            find_text(basic, "BuildingExploitYear"),
+                            find_text(basic, "BuildingDeprecation"),
+                            find_text(basic, "NotExist")
+                        ))
                 elem.clear()
+                if len(batch) >= 10000:
+                    conn.executemany("INSERT OR REPLACE INTO buildings (cid, prereg, bui_name, glv, glv_name, bui_area, floors, u_floors, pg_count, eug, nol, not_exist) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch)
+                    batch = []
+        if batch:
+            conn.executemany("INSERT OR REPLACE INTO buildings (cid, prereg, bui_name, glv, glv_name, bui_area, floors, u_floors, pg_count, eug, nol, not_exist) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch)
+        conn.commit()
     except Exception as e: pass
-    return data_map
 
-def parse_property_xml(xml_path):
-    prop_map_sets = {}
-    name_map_sets = {}
+def parse_property_xml(xml_path, conn):
+    batch = []
     try:
         context = ET.iterparse(xml_path, events=("end",))
         for event, elem in context:
@@ -367,20 +399,18 @@ def parse_property_xml(xml_path):
                                 obj_cad_nr = obj_data.findtext("ObjectCadastreNrData")
                                 if obj_cad_nr:
                                     pid = normalize_id(obj_cad_nr)
-                                    if pid not in prop_map_sets: prop_map_sets[pid] = set()
-                                    prop_map_sets[pid].add(pro_cad_nr)
-                                    if pro_name:
-                                        if pid not in name_map_sets: name_map_sets[pid] = set()
-                                        name_map_sets[pid].add(pro_name)
+                                    batch.append((pid, pro_cad_nr, pro_name))
                 elem.clear()
+                if len(batch) >= 10000:
+                    conn.executemany("INSERT INTO properties (cid, pro_cad_nr, pro_name) VALUES (?, ?, ?)", batch)
+                    batch = []
+        if batch:
+            conn.executemany("INSERT INTO properties (cid, pro_cad_nr, pro_name) VALUES (?, ?, ?)", batch)
+        conn.commit()
     except: pass
-    return (
-        {k: ";".join(sorted(v)) for k, v in prop_map_sets.items()},
-        {k: "; ".join(sorted(v)) for k, v in name_map_sets.items()}
-    )
 
-def parse_ownership_xml(xml_path):
-    own_map = {}
+def parse_ownership_xml(xml_path, conn):
+    batch = []
     try:
         context = ET.iterparse(xml_path, events=("end",))
         for event, elem in context:
@@ -390,33 +420,38 @@ def parse_ownership_xml(xml_path):
                     target_id = (rel.findtext("ObjectCadastreNr") or "").strip()
                     if target_id:
                         tid = normalize_id(target_id)
-                        if tid not in own_map: own_map[tid] = {'statuses': set(), 'persons': set()}
                         status_list = elem.find("OwnershipStatusKindList")
                         if status_list is not None:
                             for kind in status_list.findall("OwnershipStatusKind"):
                                 o_stat = (kind.findtext("OwnershipStatus") or "").strip()
                                 p_stat = (kind.findtext("PersonStatus") or "").strip()
-                                if o_stat: own_map[tid]['statuses'].add(o_stat)
-                                if p_stat: own_map[tid]['persons'].add(p_stat)
+                                if o_stat or p_stat:
+                                    batch.append((tid, o_stat, p_stat))
                 elem.clear()
+                if len(batch) >= 10000:
+                    conn.executemany("INSERT INTO ownership (cid, status, person) VALUES (?, ?, ?)", batch)
+                    batch = []
+        if batch:
+            conn.executemany("INSERT INTO ownership (cid, status, person) VALUES (?, ?, ?)", batch)
+        conn.commit()
     except: pass
-    return own_map
 
-def get_ownership_info(obj_id, prop_ids_str, ownership_map):
-    collected_status = set()
-    collected_person = set()
-    ids_to_check = set()
-    if obj_id: ids_to_check.add(obj_id)
-    if prop_ids_str: ids_to_check.update(prop_ids_str.split(";"))
-    for i in ids_to_check:
-        clean_id = normalize_id(i)
-        if clean_id in ownership_map:
-            collected_status.update(ownership_map[clean_id]['statuses'])
-            collected_person.update(ownership_map[clean_id]['persons'])
-    return "; ".join(sorted(collected_status)), "; ".join(sorted(collected_person))
+def get_ownership_info(db_conn, obj_id, prop_cads_list):
+    if not db_conn: return "", ""
+    ids_to_check = [obj_id] + prop_cads_list
+    ids_to_check = [i for i in ids_to_check if i]
+    if not ids_to_check: return "", ""
+
+    placeholders = ",".join("?" for _ in ids_to_check)
+    c = db_conn.cursor()
+    c.execute(f"SELECT status, person FROM ownership WHERE cid IN ({placeholders})", ids_to_check)
+    rows = c.fetchall()
+    own_status = "; ".join(sorted(set(r[0] for r in rows if r[0])))
+    own_person = "; ".join(sorted(set(r[1] for r in rows if r[1])))
+    return own_status, own_person
 
 # --- Merging Shapefiles Logic ---
-def merge_files(file_paths, out_path, land_map, build_map, addr_map, prop_map, name_map, own_map, selected_fields, is_parcel=True, prereg_mode=False):
+def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, prereg_mode=False):
     if not file_paths: return 0
     reference_fields = None
     kad_idx = -1
@@ -465,42 +500,60 @@ def merge_files(file_paths, out_path, land_map, build_map, addr_map, prop_map, n
                 w.field(f_name, *field_defs[f_name])
                 active_field_names.append(f_name)
 
+        cursor = db_conn.cursor() if db_conn else None
+
         for path in file_paths:
             try:
                 with shapefile.Reader(path, encoding="utf-8") as sf:
                     if len(sf.fields) != len(reference_fields): continue
                     
-                    # CHANGE: Use iterRecords() to read only attributes first
                     for i, record in enumerate(sf.iterRecords()):
                         cid = normalize_id(record[kad_idx]) if kad_idx != -1 else ""
                         row_data = list(record)
                         
-                        b_data = build_map.get(cid, {}) if not is_parcel else {}
+                        b_data = {}
+                        if cursor and not is_parcel:
+                            cursor.execute("SELECT prereg, bui_name, glv, glv_name, bui_area, floors, u_floors, pg_count, eug, nol, not_exist FROM buildings WHERE cid=?", (cid,))
+                            row = cursor.fetchone()
+                            if row: b_data = dict(zip(['Prereg', 'BUI_NAME', 'GLV', 'GLV_NAME', 'BUI_AREA', 'FLOORS', 'U_FLOORS', 'PG_COUNT', 'EUG', 'NOL', 'NOT_EXIST'], row))
                         
                         if not is_parcel:
                             prereg_val = str(b_data.get('Prereg', '')).strip()
                             is_prereg = (prereg_val == 'Pirmsreģistrēta būve')
-                            
-                            if prereg_mode and not is_prereg:
-                                continue
-                            if not prereg_mode and is_prereg:
-                                continue
+                            if prereg_mode and not is_prereg: continue
+                            if not prereg_mode and is_prereg: continue
                         
-                        prop_cads = prop_map.get(cid, "")
+                        prop_cads_list, prop_names_list = [], []
+                        if cursor:
+                            cursor.execute("SELECT pro_cad_nr, pro_name FROM properties WHERE cid=?", (cid,))
+                            prop_rows = cursor.fetchall()
+                            prop_cads_list = sorted(set(r[0] for r in prop_rows if r[0]))
+                            prop_names_list = sorted(set(r[1] for r in prop_rows if r[1]))
+                        
+                        prop_cads = ";".join(prop_cads_list)
+                        prop_names = "; ".join(prop_names_list)
                         if len(prop_cads) > 254: prop_cads = prop_cads[:254]
-                        
-                        prop_names = name_map.get(cid, "")
                         if len(prop_names) > 254: prop_names = prop_names[:254]
                         
                         own_status, own_person = "", ""
-                        if 'OWNERSHIP' in selected_fields or 'PERSON' in selected_fields:
-                             own_status, own_person = get_ownership_info(cid, prop_cads, own_map)
+                        if cursor and ('OWNERSHIP' in selected_fields or 'PERSON' in selected_fields):
+                             own_status, own_person = get_ownership_info(db_conn, cid, prop_cads_list)
                         
-                        l_data = land_map.get(cid, {}) if is_parcel else {}
+                        l_data = {}
+                        if cursor and is_parcel:
+                            cursor.execute("SELECT atvk, par_area, purl_max, p_area_max, purl_lst, p_area_lst, liz_qual FROM land WHERE cid=?", (cid,))
+                            row = cursor.fetchone()
+                            if row: l_data = dict(zip(['ATVK', 'PAR_AREA', 'PURL_MAX', 'P_AREA_MAX', 'PURL_LST', 'P_AREA_LST', 'LIZ_QUAL'], row))
                         
+                        addr_val = ""
+                        if cursor and 'ADDRESS' in active_field_names:
+                            cursor.execute("SELECT address FROM addresses WHERE cid=?", (cid,))
+                            a_row = cursor.fetchone()
+                            if a_row: addr_val = a_row[0]
+
                         for f_name in active_field_names:
                             val = None
-                            if f_name == 'ADDRESS': val = addr_map.get(cid, "")
+                            if f_name == 'ADDRESS': val = addr_val
                             elif f_name == 'PRO_CAD_NR': val = prop_cads
                             elif f_name == 'PRO_NAME': val = prop_names
                             elif f_name == 'OWNERSHIP': val = own_status
@@ -527,8 +580,6 @@ def merge_files(file_paths, out_path, land_map, build_map, addr_map, prop_map, n
                             row_data.append(val)
                         
                         w.record(*row_data)
-                        
-                        # CHANGE: Only read geometry if the record passed the checks above
                         w.shape(sf.shape(i))
                         count += 1
             except: continue
@@ -556,6 +607,7 @@ def process_territories(sel_names, res_map, sel_types, txt_urls, join_text, sele
         if "KKBuilding" not in sel_types: needed_datasets.discard('building')
 
     tmp_dir = tempfile.mkdtemp()
+    db_conn = None
     try:
         p_m, b_m = [], []
         for i, t in enumerate(sel_names):
@@ -570,7 +622,8 @@ def process_territories(sel_names, res_map, sel_types, txt_urls, join_text, sele
                         if "KKParcel" in f: p_m.append(os.path.join(tmp_dir, f))
                         else: b_m.append(os.path.join(tmp_dir, f))
         
-        l_map, a_map, p_map, n_map, o_map, b_map = {}, {}, {}, {}, {}, {}
+        db_path = os.path.join(tmp_dir, "temp_cadastre.db")
+        db_conn = get_db_conn(db_path)
         
         if needed_datasets:
             tasks = [ ('address', 'Address', parse_address_xml), ('land', 'Land', parse_land_xml), ('building', 'Building', parse_building_xml), ('property', 'Property', parse_property_xml), ('ownership', 'Ownership', parse_ownership_xml) ]
@@ -590,26 +643,13 @@ def process_territories(sel_names, res_map, sel_types, txt_urls, join_text, sele
                         total_files = len(xmls)
                         for i, x in enumerate(xmls):
                             z.extract(x, tmp_dir)
-                            parsed_data = parse_func(os.path.join(tmp_dir, x))
-                            if key == 'ownership':
-                                for k, v in parsed_data.items():
-                                    if k not in o_map: o_map[k] = {'statuses': set(), 'persons': set()}
-                                    o_map[k]['statuses'].update(v['statuses'])
-                                    o_map[k]['persons'].update(v['persons'])
-                            elif key == 'property':
-                                p_ids, p_names = parsed_data
-                                for k, v in p_ids.items():
-                                    p_map[k] = ";".join(sorted(set(p_map[k].split(";")) | set(v.split(";")))) if k in p_map else v
-                                for k, v in p_names.items():
-                                    n_map[k] = "; ".join(sorted(set(n_map[k].split("; ")) | set(v.split("; ")))) if k in n_map else v
-                            elif key == 'address': a_map.update(parsed_data)
-                            elif key == 'land': l_map.update(parsed_data)
-                            elif key == 'building': b_map.update(parsed_data)
-                                    
+                            parse_func(os.path.join(tmp_dir, x), db_conn)
                             os.remove(os.path.join(tmp_dir, x))
                             if i % 10 == 0 or i == total_files - 1:
                                 progress_bar.progress((i + 1) / total_files if total_files > 0 else 1.0)
                                 status.text(f"Processing {msg} | File {i+1}/{total_files} | Time: {round(time.time() - global_start_time, 1)} s")
+
+            index_db(db_conn)
 
         progress_bar.empty()
         zip_buf = BytesIO()
@@ -619,7 +659,7 @@ def process_territories(sel_names, res_map, sel_types, txt_urls, join_text, sele
             
             if "KKParcel" in sel_types and p_m and not prereg_mode:
                 out = os.path.join(tmp_dir, "Merged_Parcels.shp")
-                c = merge_files(p_m, out, l_map, {}, a_map, p_map, n_map, o_map, selected_fields, True, prereg_mode=False)
+                c = merge_files(p_m, out, db_conn, selected_fields, True, prereg_mode=False)
                 if c > 0:
                     for e in [".shp", ".shx", ".dbf", ".prj", ".cpg"]: zf.write(out.replace(".shp", e), f"Merged_Parcels{e}")
                     counts["Parcels"] = c
@@ -628,7 +668,7 @@ def process_territories(sel_names, res_map, sel_types, txt_urls, join_text, sele
             if "KKBuilding" in sel_types and b_m:
                 out_name = "Prereg_Buildings" if prereg_mode else "Merged_Buildings"
                 out = os.path.join(tmp_dir, f"{out_name}.shp")
-                c = merge_files(b_m, out, {}, b_map, a_map, p_map, n_map, o_map, selected_fields, False, prereg_mode=prereg_mode)
+                c = merge_files(b_m, out, db_conn, selected_fields, False, prereg_mode=prereg_mode)
                 if c > 0:
                     for e in [".shp", ".shx", ".dbf", ".prj", ".cpg"]: zf.write(out.replace(".shp", e), f"{out_name}{e}")
                     if prereg_mode:
@@ -645,6 +685,8 @@ def process_territories(sel_names, res_map, sel_types, txt_urls, join_text, sele
         status.error(f"Error: {e}")
         return None, counts
     finally:
+        if db_conn:
+            db_conn.close()
         gc.collect() 
         for _ in range(5):
             try: 
@@ -662,8 +704,7 @@ def process_excel_export(sel_names, txt_urls):
     target_atvk_codes, debug_logs = get_target_atvks(sel_names)
     headers = {'User-Agent': 'Mozilla/5.0'}
     tmp_dir = tempfile.mkdtemp()
-    
-    l_map, a_map, p_map, n_map, o_map, b_map = {}, {}, {}, {}, {}, {}
+    db_conn = None
     
     tasks = [
         ('address', 'Address', parse_address_xml),
@@ -674,6 +715,9 @@ def process_excel_export(sel_names, txt_urls):
     ]
 
     try:
+        db_path = os.path.join(tmp_dir, "temp_cadastre.db")
+        db_conn = get_db_conn(db_path)
+
         for key, msg, parse_func in tasks:
             if txt_urls.get(key):
                 status.text(f"Downloading {msg} XMLs...")
@@ -690,48 +734,60 @@ def process_excel_export(sel_names, txt_urls):
                     total_files = len(xmls)
                     for i, x in enumerate(xmls):
                         z.extract(x, tmp_dir)
-                        parsed_data = parse_func(os.path.join(tmp_dir, x))
-                        
-                        if key == 'ownership':
-                            for k, v in parsed_data.items():
-                                if k not in o_map: o_map[k] = {'statuses': set(), 'persons': set()}
-                                o_map[k]['statuses'].update(v['statuses'])
-                                o_map[k]['persons'].update(v['persons'])
-                        elif key == 'property':
-                            p_ids, p_names = parsed_data
-                            for k, v in p_ids.items():
-                                p_map[k] = ";".join(sorted(set(p_map[k].split(";")) | set(v.split(";")))) if k in p_map else v
-                            for k, v in p_names.items():
-                                n_map[k] = "; ".join(sorted(set(n_map[k].split("; ")) | set(v.split("; ")))) if k in n_map else v
-                        elif key == 'address': a_map.update(parsed_data)
-                        elif key == 'land': l_map.update(parsed_data)
-                        elif key == 'building': b_map.update(parsed_data)
-                                
+                        parse_func(os.path.join(tmp_dir, x), db_conn)
                         os.remove(os.path.join(tmp_dir, x))
                         if i % 10 == 0 or i == total_files - 1:
                             progress_bar.progress((i + 1) / total_files if total_files > 0 else 1.0)
                             status.text(f"Processing {msg} | File {i+1}/{total_files} | Time: {round(time.time() - global_start_time, 1)} s")
 
+        index_db(db_conn)
         status.text("Building Excel File...")
         progress_bar.empty()
 
+        cursor = db_conn.cursor()
+        
+        # Build Parcels Rows
         parcel_rows = []
-        for cid in l_map.keys():
-            p_cads = p_map.get(cid, "")
-            o_stat, o_pers = get_ownership_info(cid, p_cads, o_map)
+        cursor.execute("SELECT cid FROM land")
+        land_cids = [r[0] for r in cursor.fetchall()]
+        for cid in land_cids:
+            cursor.execute("SELECT address FROM addresses WHERE cid=?", (cid,))
+            a_row = cursor.fetchone()
+            addr = a_row[0] if a_row else ""
+
+            cursor.execute("SELECT pro_cad_nr, pro_name FROM properties WHERE cid=?", (cid,))
+            prop_rows = cursor.fetchall()
+            prop_cads_list = sorted(set(r[0] for r in prop_rows if r[0]))
+            p_cads = ";".join(prop_cads_list)
+            p_names = "; ".join(sorted(set(r[1] for r in prop_rows if r[1])))
+
+            o_stat, o_pers = get_ownership_info(db_conn, cid, prop_cads_list)
+
             parcel_rows.append({
-                'CODE': cid, 'ADDRESS': a_map.get(cid, ""), 'PRO_CAD_NR': p_cads, 
-                'PRO_NAME': n_map.get(cid, ""), 'OWNER_SHIP': o_stat, 'PERSON': o_pers
+                'CODE': cid, 'ADDRESS': addr, 'PRO_CAD_NR': p_cads, 
+                'PRO_NAME': p_names, 'OWNER_SHIP': o_stat, 'PERSON': o_pers
             })
 
+        # Build Buildings Rows
         building_rows = []
-        for cid, b_data in b_map.items():
-            if str(b_data.get('Prereg', '')).strip() == 'Pirmsreģistrēta būve': continue
-            p_cads = p_map.get(cid, "")
-            o_stat, o_pers = get_ownership_info(cid, p_cads, o_map)
+        cursor.execute("SELECT cid FROM buildings WHERE prereg != 'Pirmsreģistrēta būve'")
+        b_cids = [r[0] for r in cursor.fetchall()]
+        for cid in b_cids:
+            cursor.execute("SELECT address FROM addresses WHERE cid=?", (cid,))
+            a_row = cursor.fetchone()
+            addr = a_row[0] if a_row else ""
+
+            cursor.execute("SELECT pro_cad_nr, pro_name FROM properties WHERE cid=?", (cid,))
+            prop_rows = cursor.fetchall()
+            prop_cads_list = sorted(set(r[0] for r in prop_rows if r[0]))
+            p_cads = ";".join(prop_cads_list)
+            p_names = "; ".join(sorted(set(r[1] for r in prop_rows if r[1])))
+
+            o_stat, o_pers = get_ownership_info(db_conn, cid, prop_cads_list)
+
             building_rows.append({
-                'CODE': cid, 'ADDRESS': a_map.get(cid, ""), 'PRO_CAD_NR': p_cads, 
-                'PRO_NAME': n_map.get(cid, ""), 'OWNER_SHIP': o_stat, 'PERSON': o_pers
+                'CODE': cid, 'ADDRESS': addr, 'PRO_CAD_NR': p_cads, 
+                'PRO_NAME': p_names, 'OWNER_SHIP': o_stat, 'PERSON': o_pers
             })
 
         df_parcels = pd.DataFrame(parcel_rows)
@@ -754,6 +810,8 @@ def process_excel_export(sel_names, txt_urls):
         status.error(f"Error during Excel generation: {e}")
         return None, 0, 0
     finally:
+        if db_conn:
+            db_conn.close()
         gc.collect() 
         for _ in range(5):
             try: 
@@ -830,16 +888,13 @@ if res_map:
             elapsed_time = round(time.time() - start_time, 1)
             
             if final_data:
-                # API UPDATE NOW HAPPENS HERE, HIDDEN BEHIND THE SCENES
                 st.session_state["total_downloads"] = update_counter()
-                
                 st.success(f"Shapefile Data processed successfully in {elapsed_time} seconds!")
                 
                 summary_data = [{"Layer": l, "Total Polygons": c} for l, c in counts.items() if c > 0]
                 if summary_data:
                     st.table(pd.DataFrame(summary_data))
 
-                # PURE NATIVE DOWNLOAD - ZERO CALLBACKS
                 st.download_button(
                     label="📥 Download Merged Shapefiles (.zip)",
                     data=final_data,
@@ -861,9 +916,7 @@ if res_map:
             elapsed_time = round(time.time() - start_time, 1)
             
             if excel_data:
-                # API UPDATE NOW HAPPENS HERE, HIDDEN BEHIND THE SCENES
                 st.session_state["total_downloads"] = update_counter()
-                
                 st.success(f"Excel File Built Successfully in {elapsed_time} seconds!")
                 
                 st.table(pd.DataFrame([
@@ -871,7 +924,6 @@ if res_map:
                     {"Sheet": "Buildings", "Total Records": b_count}
                 ]))
                 
-                # PURE NATIVE DOWNLOAD - ZERO CALLBACKS
                 st.download_button(
                     label="📥 Download Property_Owners.xlsx",
                     data=excel_data,
@@ -889,23 +941,17 @@ if res_map:
         
         if st.button("🏗️ Generate Preregistered Buildings", type="primary", key="prereg_btn", disabled=btn3_disabled):
             start_time = time.time()
-            
-            # CHANGE: Passed True for join_text and ['BUI_NAME'] to ensure building XML is downloaded!
             final_data, counts = process_territories(sel, res_map, ["KKBuilding"], txt_urls, True, ['BUI_NAME'], prereg_mode=True)
-            
             elapsed_time = round(time.time() - start_time, 1)
             
             if final_data:
-                # API UPDATE NOW HAPPENS HERE, HIDDEN BEHIND THE SCENES
                 st.session_state["total_downloads"] = update_counter()
-                
                 st.success(f"Preregistered Buildings processed successfully in {elapsed_time} seconds!")
                 
                 summary_data = [{"Layer": l, "Total Polygons": c} for l, c in counts.items() if c > 0]
                 if summary_data:
                     st.table(pd.DataFrame(summary_data))
 
-                # PURE NATIVE DOWNLOAD - ZERO CALLBACKS
                 st.download_button(
                     label="📥 Download Prereg_buildings.zip",
                     data=final_data,
