@@ -919,7 +919,7 @@ with st.sidebar:
             user_geom = get_user_geometry(uploaded_zip)
             if user_geom:
                 st.success("✅ Spatial Filter successfully applied!")
-                st.info("👉 **Next Step:** Select the target territory (e.g. 'Madonas novads') in the main window.")
+                st.info("👉 **Next Step:** Select the target territory in the main window.")
             else:
                 st.error("❌ Could not read geometry from ZIP. Make sure it contains valid Shapefile files.")
 
@@ -942,7 +942,7 @@ if res_map:
     
     # --- UI Safety Checks ---
     if user_geom is not None and len(sel) == 0:
-        st.warning("⚠️ **Mandatory Step:** You uploaded a spatial filter. Please select the corresponding territory (e.g., 'Madonas novads') from the list above to process it.")
+        st.warning("⚠️ **Mandatory Step:** You uploaded a spatial filter. Please select the corresponding territory from the list above to process it.")
 
     # Disable Select All if a spatial file is uploaded
     select_all = st.checkbox(
@@ -1117,4 +1117,5 @@ if "total_downloads" not in st.session_state:
     st.session_state["total_downloads"] = get_counter()
 
 st.markdown(f'<div class="counter-container"><div class="counter-box">📥 Total Generated: {st.session_state["total_downloads"]}</div></div>', unsafe_allow_html=True)
+
 
