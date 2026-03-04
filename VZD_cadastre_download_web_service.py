@@ -15,7 +15,7 @@ import re
 import json
 import sqlite3
 
-# --- New Spatial Library ---
+# --- Spatial Library ---
 from shapely.geometry import shape, box
 from shapely.ops import unary_union
 
@@ -180,6 +180,7 @@ except Exception as e:
     GIST_URL = None
     GIST_HEADERS = None
 
+# --- UPDATED GIST COUNTER FUNCTIONS ---
 def get_counter():
     if not GIST_URL: return 0
     try:
@@ -188,12 +189,21 @@ def get_counter():
             gist_data = response.json()
             content = gist_data["files"]["counter.json"]["content"]
             return json.loads(content).get("count", 0)
-    except: pass
-    return 0
+        else:
+            # If GitHub API returns an error
+            return None 
+    except: 
+        # If there is a network timeout
+        return None
 
 def update_counter():
     if not GIST_URL: return 1
     current_count = get_counter()
+    
+    # Safety Lock: Do not overwrite if we couldn't fetch the real count
+    if current_count is None:
+        return st.session_state.get("total_downloads", 0)
+        
     new_count = current_count + 1
     
     payload = {
@@ -205,8 +215,9 @@ def update_counter():
     }
     try:
         requests.patch(GIST_URL, headers=GIST_HEADERS, json=payload, timeout=5)
-    except: pass
-    return new_count
+        return new_count
+    except: 
+        return current_count
 
 @st.cache_data
 def get_territory_list():
@@ -919,7 +930,7 @@ with st.sidebar:
             user_geom = get_user_geometry(uploaded_zip)
             if user_geom:
                 st.success("✅ Spatial Filter successfully applied!")
-                st.info("👉 **Next Step:** Select the target territory in the main window.")
+                st.info("👉 **Next Step:** Select the target territory (e.g. 'Madonas novads') in the main window.")
             else:
                 st.error("❌ Could not read geometry from ZIP. Make sure it contains valid Shapefile files.")
 
@@ -942,7 +953,7 @@ if res_map:
     
     # --- UI Safety Checks ---
     if user_geom is not None and len(sel) == 0:
-        st.warning("⚠️ **Mandatory Step:** You uploaded a spatial filter. Please select the corresponding territory from the list above to process it.")
+        st.warning("⚠️ **Mandatory Step:** You uploaded a spatial filter. Please select the corresponding territory (e.g., 'Madonas novads') from the list above to process it.")
 
     # Disable Select All if a spatial file is uploaded
     select_all = st.checkbox(
@@ -1014,7 +1025,7 @@ if res_map:
         Export (`CODE`, `ADDRESS`, `PRO_CAD_NR`, `PRO_NAME`, `OWNER_SHIP`, `PERSON`) directly into an `.xlsx` file. 
         **Advantage:** `PRO_CAD_NR` lists are not truncated and remain fully intact regardless of length.
         
-        ⚠️ *Note: The spatial filter upload does not apply to this Excel generator. If you need a filtered list of owners, simply drag the filtered `.dbf` file generated in the Merge Shapefiles tab directly into Excel and use vlookup!*
+        ⚠️ *Note: The spatial filter upload does not apply to this Excel generator. If you need a filtered list of owners, simply drag the filtered `.dbf` file generated in the Shapefile tab directly into Excel!*
         """)
         
         btn2_disabled = len(sel) == 0
@@ -1117,5 +1128,3 @@ if "total_downloads" not in st.session_state:
     st.session_state["total_downloads"] = get_counter()
 
 st.markdown(f'<div class="counter-container"><div class="counter-box">📥 Total Generated: {st.session_state["total_downloads"]}</div></div>', unsafe_allow_html=True)
-
-
