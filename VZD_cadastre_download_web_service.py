@@ -469,14 +469,19 @@ def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, 
         except: continue
     if not reference_fields: return 0
 
+    # These fields are marked to be completely removed from output
+    fields_to_delete = {"OBJECTCODE", "GROUP_CODE"}
+    original_indices_to_keep = []
+
+    # Updated field limits based on the provided CSV sizes
     field_defs = {
-        'ADDRESS': ('C', 254), 'PRO_CAD_NR': ('C', 254), 'PRO_NAME': ('C', 254),
-        'OWNERSHIP': ('C', 254), 'PERSON': ('C', 254), 
-        'ATVK': ('C', 10), 'PAR_AREA': ('N', 12, 2), 'PURL_MAX': ('C', 10), 'P_AREA_MAX': ('N', 12, 2),
-        'PURL_LST': ('C', 254), 'P_AREA_LST': ('C', 254), 'LIZ_QUAL': ('N', 12, 2),
-        'BUI_NAME': ('C', 254), 'GLV': ('C', 10), 'GLV_NAME': ('C', 254),
-        'BUI_AREA': ('N', 12, 2), 'FLOORS': ('N', 10, 0), 'U_FLOORS': ('N', 10, 0),
-        'PG_COUNT': ('N', 10, 0), 'EUG': ('C', 50), 'NOL': ('C', 50), 'NOT_EXIST': ('C', 254)
+        'ADDRESS': ('C', 150), 'PRO_CAD_NR': ('C', 254), 'PRO_NAME': ('C', 100),
+        'OWNERSHIP': ('C', 50), 'PERSON': ('C', 60), 
+        'ATVK': ('C', 7), 'PAR_AREA': ('N', 10, 2), 'PURL_MAX': ('C', 4), 'P_AREA_MAX': ('N', 10, 2),
+        'PURL_LST': ('C', 60), 'P_AREA_LST': ('C', 70), 'LIZ_QUAL': ('N', 4, 2),
+        'BUI_NAME': ('C', 100), 'GLV': ('C', 4), 'GLV_NAME': ('C', 70),
+        'BUI_AREA': ('N', 8, 2), 'FLOORS': ('N', 10, 0), 'U_FLOORS': ('N', 10, 0),
+        'PG_COUNT': ('N', 10, 0), 'EUG': ('C', 50), 'NOL': ('C', 50), 'NOT_EXIST': ('C', 100)
     }
 
     active_field_names = []
@@ -488,9 +493,34 @@ def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, 
     
     count = 0
     with shapefile.Writer(out_path, encoding="utf-8") as w:
-        for field in reference_fields:
-            if field[0] != 'DeletionFlag': w.field(*field)
+        
+        # Write remaining original fields, adjusting limits if needed
+        for i, field in enumerate(reference_fields):
+            if field[0] == 'DeletionFlag':
+                continue
+            
+            f_name = field[0]
+            f_upper = f_name.upper()
+            
+            # Skip fields requested to be deleted
+            if f_upper in fields_to_delete:
+                continue
+                
+            # Apply custom lengths to original source file columns if specified in CSV
+            f_type = field[1]
+            f_len = field[2]
+            f_dec = field[3]
+            
+            if f_upper == "CODE": f_len = 14 if not is_parcel else 11
+            elif f_upper == "GEOM_ACT_D": f_len = 10
+            elif f_upper == "AREA_SCALE": f_len = 16 if is_parcel else 15
+            elif f_upper == "PARCELCODE": f_len = 11
+            
+            w.field(f_name, f_type, f_len, f_dec)
+            # Map index (ignoring DeletionFlag) to correctly retrieve data
+            original_indices_to_keep.append(i - 1) 
 
+        # Write joined XML fields
         for f_name in preferred_order:
             if f_name in selected_fields:
                 if not is_parcel and f_name in ['ATVK', 'PAR_AREA', 'PURL_MAX', 'P_AREA_MAX', 'PURL_LST', 'P_AREA_LST', 'LIZ_QUAL']:
@@ -509,7 +539,9 @@ def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, 
                     
                     for i, record in enumerate(sf.iterRecords()):
                         cid = normalize_id(record[kad_idx]) if kad_idx != -1 else ""
-                        row_data = list(record)
+                        
+                        # Only grab the data from columns we didn't delete
+                        row_data = [record[idx] for idx in original_indices_to_keep]
                         
                         b_data = {}
                         if cursor and not is_parcel:
@@ -532,8 +564,6 @@ def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, 
                         
                         prop_cads = ";".join(prop_cads_list)
                         prop_names = "; ".join(prop_names_list)
-                        if len(prop_cads) > 254: prop_cads = prop_cads[:254]
-                        if len(prop_names) > 254: prop_names = prop_names[:254]
                         
                         own_status, own_person = "", ""
                         if cursor and ('OWNERSHIP' in selected_fields or 'PERSON' in selected_fields):
@@ -576,7 +606,11 @@ def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, 
                             elif f_name == 'NOL': val = b_data.get('NOL', "")
                             elif f_name == 'NOT_EXIST': val = b_data.get('NOT_EXIST', "")
                             
-                            if isinstance(val, str) and len(val) > 254: val = val[:254]
+                            # Trim the values perfectly to fit their new compact lengths
+                            limit = field_defs[f_name][1]
+                            if isinstance(val, str) and len(val) > limit: 
+                                val = val[:limit]
+                            
                             row_data.append(val)
                         
                         w.record(*row_data)
