@@ -1014,7 +1014,7 @@ if res_map:
         Export (`CODE`, `ADDRESS`, `PRO_CAD_NR`, `PRO_NAME`, `OWNER_SHIP`, `PERSON`) directly into an `.xlsx` file. 
         **Advantage:** `PRO_CAD_NR` lists are not truncated and remain fully intact regardless of length.
         
-        ⚠️ *Note: The spatial filter upload does not apply to this Excel generator. If you need a filtered list of owners, simply drag the filtered `.dbf` file generated in the Shapefile tab directly into Excel!*
+        ⚠️ *Note: The spatial filter upload does not apply to this Excel generator. If you need a filtered list of owners, simply drag the filtered `.dbf` file generated in the Merge Shapefiles tab directly into Excel and use vlookup!*
         """)
         
         btn2_disabled = len(sel) == 0
@@ -1117,3 +1117,4 @@ if "total_downloads" not in st.session_state:
     st.session_state["total_downloads"] = get_counter()
 
 st.markdown(f'<div class="counter-container"><div class="counter-box">📥 Total Generated: {st.session_state["total_downloads"]}</div></div>', unsafe_allow_html=True)
+
