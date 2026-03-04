@@ -15,6 +15,10 @@ import re
 import json
 import sqlite3
 
+# --- New Spatial Library ---
+from shapely.geometry import shape, box
+from shapely.ops import unary_union
+
 # --- Configuration & SSL Setup ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 st.set_page_config(page_title="VZD Cadastre Merger", page_icon="🌍", layout="wide")
@@ -126,7 +130,6 @@ FIELD_CONFIG = {
 # --- DB Helper Functions ---
 def get_db_conn(db_path):
     conn = sqlite3.connect(db_path)
-    # Extremely aggressive performance PRAGMAs (safe because it's a temp DB)
     conn.execute("PRAGMA synchronous = OFF")
     conn.execute("PRAGMA journal_mode = MEMORY")
     conn.execute("PRAGMA temp_store = MEMORY")
@@ -240,6 +243,41 @@ def get_text_resources():
     except: pass
     return urls
 
+# --- Parse Uploaded Spatial File ---
+def get_user_geometry(zip_file_obj):
+    tmp = tempfile.mkdtemp()
+    try:
+        with zipfile.ZipFile(zip_file_obj, 'r') as z:
+            z.extractall(tmp)
+        
+        shp_path = None
+        for root, dirs, files in os.walk(tmp):
+            for f in files:
+                if f.lower().endswith('.shp'):
+                    shp_path = os.path.join(root, f)
+                    break
+            if shp_path: break
+        
+        if not shp_path:
+            return None
+            
+        with shapefile.Reader(shp_path) as sf:
+            geoms = []
+            for s in sf.shapes():
+                if s.points:
+                    try:
+                        geoms.append(shape(s.__geo_interface__))
+                    except:
+                        pass
+                        
+        if geoms:
+            return unary_union(geoms)
+        return None
+    except Exception as e:
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
 def normalize_id(text):
     if text is None: return ""
     s = str(text).replace(" ", "").strip()
@@ -256,7 +294,7 @@ def find_text(elem, suffix, default=""):
     child = find_child(elem, suffix)
     return child.text.strip() if child is not None and child.text else default
 
-# --- XML Parsing Functions (Now mapped to SQLite) ---
+# --- XML Parsing Functions ---
 def format_lv_address(elem):
     parts = []
     street = (elem.findtext("Street") or "").strip()
@@ -451,7 +489,7 @@ def get_ownership_info(db_conn, obj_id, prop_cads_list):
     return own_status, own_person
 
 # --- Merging Shapefiles Logic ---
-def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, prereg_mode=False):
+def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, prereg_mode=False, user_geom=None):
     if not file_paths: return 0
     reference_fields = None
     kad_idx = -1
@@ -469,11 +507,9 @@ def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, 
         except: continue
     if not reference_fields: return 0
 
-    # These fields are marked to be completely removed from output
     fields_to_delete = {"OBJECTCODE", "GROUP_CODE"}
     original_indices_to_keep = []
 
-    # Updated field limits based on the provided CSV sizes
     field_defs = {
         'ADDRESS': ('C', 150), 'PRO_CAD_NR': ('C', 254), 'PRO_NAME': ('C', 100),
         'OWNERSHIP': ('C', 50), 'PERSON': ('C', 60), 
@@ -491,10 +527,12 @@ def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, 
         'BUI_NAME', 'GLV', 'GLV_NAME', 'BUI_AREA', 'FLOORS', 'U_FLOORS', 'PG_COUNT', 'EUG', 'NOL', 'NOT_EXIST'
     ]
     
+    user_bbox = None
+    if user_geom is not None:
+        user_bbox = box(*user_geom.bounds)
+
     count = 0
     with shapefile.Writer(out_path, encoding="utf-8") as w:
-        
-        # Write remaining original fields, adjusting limits if needed
         for i, field in enumerate(reference_fields):
             if field[0] == 'DeletionFlag':
                 continue
@@ -502,11 +540,9 @@ def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, 
             f_name = field[0]
             f_upper = f_name.upper()
             
-            # Skip fields requested to be deleted
             if f_upper in fields_to_delete:
                 continue
                 
-            # Apply custom lengths to original source file columns if specified in CSV
             f_type = field[1]
             f_len = field[2]
             f_dec = field[3]
@@ -517,10 +553,8 @@ def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, 
             elif f_upper == "PARCELCODE": f_len = 11
             
             w.field(f_name, f_type, f_len, f_dec)
-            # Map index (ignoring DeletionFlag) to correctly retrieve data
             original_indices_to_keep.append(i - 1) 
 
-        # Write joined XML fields
         for f_name in preferred_order:
             if f_name in selected_fields:
                 if not is_parcel and f_name in ['ATVK', 'PAR_AREA', 'PURL_MAX', 'P_AREA_MAX', 'PURL_LST', 'P_AREA_LST', 'LIZ_QUAL']:
@@ -537,10 +571,23 @@ def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, 
                 with shapefile.Reader(path, encoding="utf-8") as sf:
                     if len(sf.fields) != len(reference_fields): continue
                     
-                    for i, record in enumerate(sf.iterRecords()):
-                        cid = normalize_id(record[kad_idx]) if kad_idx != -1 else ""
+                    for shape_rec in sf.iterShapeRecords():
+                        cad_shape = shape_rec.shape
+                        record = shape_rec.record
                         
-                        # Only grab the data from columns we didn't delete
+                        # --- SPATIAL FILTER LOGIC ---
+                        if user_geom is not None and cad_shape.points:
+                            cad_box = box(*cad_shape.bbox)
+                            if not user_bbox.intersects(cad_box):
+                                continue
+                            try:
+                                cad_shapely = shape(cad_shape.__geo_interface__)
+                                if not user_geom.intersects(cad_shapely):
+                                    continue
+                            except:
+                                continue 
+                        
+                        cid = normalize_id(record[kad_idx]) if kad_idx != -1 else ""
                         row_data = [record[idx] for idx in original_indices_to_keep]
                         
                         b_data = {}
@@ -606,7 +653,6 @@ def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, 
                             elif f_name == 'NOL': val = b_data.get('NOL', "")
                             elif f_name == 'NOT_EXIST': val = b_data.get('NOT_EXIST', "")
                             
-                            # Trim the values perfectly to fit their new compact lengths
                             limit = field_defs[f_name][1]
                             if isinstance(val, str) and len(val) > limit: 
                                 val = val[:limit]
@@ -614,7 +660,7 @@ def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, 
                             row_data.append(val)
                         
                         w.record(*row_data)
-                        w.shape(sf.shape(i))
+                        w.shape(cad_shape)
                         count += 1
             except: continue
             
@@ -624,7 +670,7 @@ def merge_files(file_paths, out_path, db_conn, selected_fields, is_parcel=True, 
     
     return count
 
-def process_territories(sel_names, res_map, sel_types, txt_urls, join_text, selected_fields, prereg_mode=False):
+def process_territories(sel_names, res_map, sel_types, txt_urls, join_text, selected_fields, prereg_mode=False, user_geom=None):
     global_start_time = time.time()
     status = st.empty()
     progress_bar = st.progress(0)
@@ -689,11 +735,11 @@ def process_territories(sel_names, res_map, sel_types, txt_urls, join_text, sele
         zip_buf = BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             success = False
-            status.text("Merging Shapefiles...")
+            status.text("Merging Shapefiles... Applying Filters...")
             
             if "KKParcel" in sel_types and p_m and not prereg_mode:
                 out = os.path.join(tmp_dir, "Merged_Parcels.shp")
-                c = merge_files(p_m, out, db_conn, selected_fields, True, prereg_mode=False)
+                c = merge_files(p_m, out, db_conn, selected_fields, True, prereg_mode=False, user_geom=user_geom)
                 if c > 0:
                     for e in [".shp", ".shx", ".dbf", ".prj", ".cpg"]: zf.write(out.replace(".shp", e), f"Merged_Parcels{e}")
                     counts["Parcels"] = c
@@ -702,7 +748,7 @@ def process_territories(sel_names, res_map, sel_types, txt_urls, join_text, sele
             if "KKBuilding" in sel_types and b_m:
                 out_name = "Prereg_Buildings" if prereg_mode else "Merged_Buildings"
                 out = os.path.join(tmp_dir, f"{out_name}.shp")
-                c = merge_files(b_m, out, db_conn, selected_fields, False, prereg_mode=prereg_mode)
+                c = merge_files(b_m, out, db_conn, selected_fields, False, prereg_mode=prereg_mode, user_geom=user_geom)
                 if c > 0:
                     for e in [".shp", ".shx", ".dbf", ".prj", ".cpg"]: zf.write(out.replace(".shp", e), f"{out_name}{e}")
                     if prereg_mode:
@@ -854,14 +900,29 @@ def process_excel_export(sel_names, txt_urls):
             except: 
                 time.sleep(0.2)
 
-
 # --- Main App Interface ---
 st.title("🌍 VZD Cadastre Merger")
 st.markdown("Combines Spatial Polygons with selected textual data attributes (VZD XML), or exports textual metadata to Excel.")
 
+# Variable to hold the parsed user geometry
+user_geom = None
+
 with st.sidebar:
     st.header("⚙️ Configuration")
     st.markdown("Select your territories in the main window to begin processing.")
+    
+    st.markdown("### ✂️ Spatial Filter (Optional)")
+    uploaded_zip = st.file_uploader("Upload AOI Shapefile (.zip)", type="zip", help="Upload a ZIP containing a Shapefile (.shp, .shx, .dbf) to export only intersecting Cadastre objects. MUST be in EPSG:3059 (LKS-92).")
+    
+    if uploaded_zip:
+        with st.spinner("Parsing uploaded geometry..."):
+            user_geom = get_user_geometry(uploaded_zip)
+            if user_geom:
+                st.success("✅ Spatial Filter successfully applied!")
+                st.info("👉 **Next Step:** Select the target territory (e.g. 'Madonas novads') in the main window.")
+            else:
+                st.error("❌ Could not read geometry from ZIP. Make sure it contains valid Shapefile files.")
+
     st.divider()
     with st.spinner("Checking VZD Open Data..."):
         res_map = get_territory_list()
@@ -879,7 +940,18 @@ if res_map:
     
     sel = st.multiselect(label_text, t_names, key="sel_territories")
     
-    if st.checkbox("Select All Territories"): 
+    # --- UI Safety Checks ---
+    if user_geom is not None and len(sel) == 0:
+        st.warning("⚠️ **Mandatory Step:** You uploaded a spatial filter. Please select the corresponding territory (e.g., 'Madonas novads') from the list above to process it.")
+
+    # Disable Select All if a spatial file is uploaded
+    select_all = st.checkbox(
+        "Select All Territories", 
+        disabled=(user_geom is not None), 
+        help="Disabled when using a Spatial Filter to prevent server overload."
+    )
+    
+    if select_all: 
         sel = t_names
 
     st.divider()
@@ -915,10 +987,11 @@ if res_map:
                         selected_fields.extend(selected)
         
         btn1_disabled = len(sel) == 0 or len(types) == 0
+        btn1_text = "🚀 Process and Generate Shapefiles" if not btn1_disabled else "⚠️ Select a Territory to Process"
         
-        if st.button("🚀 Process and Generate Shapefiles", type="primary", disabled=btn1_disabled):
+        if st.button(btn1_text, type="primary", disabled=btn1_disabled):
             start_time = time.time()
-            final_data, counts = process_territories(sel, res_map, types, txt_urls, join_text, selected_fields, prereg_mode=False)
+            final_data, counts = process_territories(sel, res_map, types, txt_urls, join_text, selected_fields, prereg_mode=False, user_geom=user_geom)
             elapsed_time = round(time.time() - start_time, 1)
             
             if final_data:
@@ -940,11 +1013,14 @@ if res_map:
         st.markdown("""
         Export (`CODE`, `ADDRESS`, `PRO_CAD_NR`, `PRO_NAME`, `OWNER_SHIP`, `PERSON`) directly into an `.xlsx` file. 
         **Advantage:** `PRO_CAD_NR` lists are not truncated and remain fully intact regardless of length.
+        
+        ⚠️ *Note: The spatial filter upload does not apply to this Excel generator. If you need a filtered list of owners, simply drag the filtered `.dbf` file generated in the Shapefile tab directly into Excel!*
         """)
         
         btn2_disabled = len(sel) == 0
+        btn2_text = "📊 Generate Excel Export" if not btn2_disabled else "⚠️ Select a Territory to Process"
         
-        if st.button("📊 Generate Excel Export", type="primary", key="excel_btn", disabled=btn2_disabled):
+        if st.button(btn2_text, type="primary", key="excel_btn", disabled=btn2_disabled):
             start_time = time.time()
             excel_data, p_count, b_count = process_excel_export(sel, txt_urls)
             elapsed_time = round(time.time() - start_time, 1)
@@ -972,10 +1048,11 @@ if res_map:
         """)
         
         btn3_disabled = len(sel) == 0
+        btn3_text = "🏗️ Generate Preregistered Buildings" if not btn3_disabled else "⚠️ Select a Territory to Process"
         
-        if st.button("🏗️ Generate Preregistered Buildings", type="primary", key="prereg_btn", disabled=btn3_disabled):
+        if st.button(btn3_text, type="primary", key="prereg_btn", disabled=btn3_disabled):
             start_time = time.time()
-            final_data, counts = process_territories(sel, res_map, ["KKBuilding"], txt_urls, True, ['BUI_NAME'], prereg_mode=True)
+            final_data, counts = process_territories(sel, res_map, ["KKBuilding"], txt_urls, True, ['BUI_NAME'], prereg_mode=True, user_geom=user_geom)
             elapsed_time = round(time.time() - start_time, 1)
             
             if final_data:
