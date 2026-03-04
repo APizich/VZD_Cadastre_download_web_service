@@ -3,3 +3,4 @@ requests
 pyshp
 pandas
 openpyxl
+shapely==2.0.6
