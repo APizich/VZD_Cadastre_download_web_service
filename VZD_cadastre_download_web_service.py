@@ -238,6 +238,14 @@ def get_territory_list():
 
 @st.cache_data
 def get_text_resources():
+    """
+    Discover VZD text-data ZIP resources from data.gov.lv.
+
+    More tolerant than the original version:
+    - compares resource names in lowercase;
+    - accepts small naming changes;
+    - uses res.get("url") safely.
+    """
     headers = {'User-Agent': 'Mozilla/5.0'}
     urls = {'land': None, 'address': None, 'property': None, 'ownership': None, 'building': None}
     try:
@@ -246,15 +254,36 @@ def get_text_resources():
         if data.get('success'):
             for res in data['result']['resources']:
                 name = res.get('name', '')
-                if "1." in name and "Nekustamo īpašumu" in name: urls['property'] = res['url']
-                if "2." in name and "pašumtiesību" in name: urls['ownership'] = res['url']
-                if "3." in name and "Zemes vienību" in name: urls['land'] = res['url']
-                if "5." in name and "Būv" in name: urls['building'] = res['url']
-                if "7." in name and "adreses" in name: urls['address'] = res['url']
-    except: pass
+                lname = name.lower()
+                url = res.get('url', '')
+                if not url:
+                    continue
+
+                # 1. Nekustamie īpašumi
+                if "1." in lname and ("nekustamo īpašumu" in lname or "nekustam" in lname):
+                    urls['property'] = url
+
+                # 2. Personu īpašumtiesības
+                elif "2." in lname and ("īpašumties" in lname or "ipasumties" in lname):
+                    urls['ownership'] = url
+
+                # 3. Zemes vienības
+                elif "3." in lname and ("zemes vienību" in lname or "zemes vienibas" in lname):
+                    urls['land'] = url
+
+                # 5. Būves
+                elif "5." in lname and ("būv" in lname or "buv" in lname):
+                    urls['building'] = url
+
+                # 7. Adreses
+                elif "7." in lname and ("adres" in lname):
+                    urls['address'] = url
+
+    except Exception as e:
+        print(f"Text resource discovery error: {e}")
+
     return urls
 
-# --- Parse Uploaded Spatial File ---
 def get_user_geometry(zip_file_obj):
     tmp = tempfile.mkdtemp()
     try:
@@ -290,104 +319,216 @@ def get_user_geometry(zip_file_obj):
         shutil.rmtree(tmp, ignore_errors=True)
 
 def normalize_id(text):
-    if text is None: return ""
+    if text is None:
+        return ""
     s = str(text).replace(" ", "").strip()
     return s.zfill(11) if s.isdigit() and len(s) < 11 else s
 
-def find_child(elem, suffix):
-    if elem is None: return None
+def local_name(tag):
+    """
+    Return an XML tag without namespace.
+
+    Example:
+    "{http://ivis.eps.gov.lv/...}ParcelBasicData" -> "ParcelBasicData"
+    "ParcelBasicData" -> "ParcelBasicData"
+
+    This is needed because VZD text XML now contains the default xmlns namespace.
+    """
+    if tag is None:
+        return ""
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+def find_child(elem, name):
+    """
+    Namespace-safe direct child lookup by local element name.
+    """
+    if elem is None:
+        return None
     for child in elem:
-        if child.tag.endswith(suffix):
+        if local_name(child.tag) == name:
             return child
     return None
 
-def find_text(elem, suffix, default=""):
-    child = find_child(elem, suffix)
+def find_children(elem, name):
+    """
+    Namespace-safe direct children lookup by local element name.
+    """
+    if elem is None:
+        return []
+    return [child for child in elem if local_name(child.tag) == name]
+
+def find_text(elem, name, default=""):
+    """
+    Namespace-safe direct child text lookup by local element name.
+    """
+    child = find_child(elem, name)
     return child.text.strip() if child is not None and child.text else default
 
 # --- XML Parsing Functions ---
 def format_lv_address(elem):
+    """
+    Build a readable Latvian address from AddressData.
+
+    Namespace-safe: uses find_text() instead of ElementTree.findtext().
+    """
     parts = []
-    street = (elem.findtext("Street") or "").strip()
-    house = (elem.findtext("House") or "").strip()
-    if street and house: parts.append(f"{street} {house}")
-    elif street: parts.append(street)
-    elif house: parts.append(house)
-    village = (elem.findtext("Village") or "").strip()
-    if village: parts.append(village)
+
+    street = find_text(elem, "Street")
+    house = find_text(elem, "House")
+    if street and house:
+        parts.append(f"{street} {house}")
+    elif street:
+        parts.append(street)
+    elif house:
+        parts.append(house)
+
+    village = find_text(elem, "Village")
+    if village:
+        parts.append(village)
+
     loc = []
-    parish = (elem.findtext("Parish") or "").strip()
-    town = (elem.findtext("Town") or "").strip()
-    if parish: loc.append(parish)
-    if town: loc.append(town)
-    if loc: parts.append(", ".join(loc))
-    county = (elem.findtext("County") or "").strip()
-    if county: parts.append(county)
-    p_idx = (elem.findtext("PostIndex") or "").strip()
+    parish = find_text(elem, "Parish")
+    town = find_text(elem, "Town")
+    if parish:
+        loc.append(parish)
+    if town:
+        loc.append(town)
+    if loc:
+        parts.append(", ".join(loc))
+
+    county = find_text(elem, "County")
+    if county:
+        parts.append(county)
+
+    p_idx = find_text(elem, "PostIndex")
     if p_idx:
-        if p_idx.startswith("LV") and "-" not in p_idx: p_idx = p_idx.replace("LV", "LV-")
+        if p_idx.startswith("LV") and "-" not in p_idx:
+            p_idx = p_idx.replace("LV", "LV-")
         parts.append(p_idx)
+
     return ", ".join(parts)
 
 def parse_address_xml(xml_path, conn):
+    """
+    Parse Dataset 7: Addresses.
+
+    VZD specification:
+    AddressItemData contains ObjectRelation/ObjectCadastreNr and AddressData.
+    AddressData contains the structured address fields.
+
+    Namespace-safe implementation.
+    """
     batch = []
     try:
         context = ET.iterparse(xml_path, events=("end",))
         for event, elem in context:
-            if elem.tag.endswith("AddressItemData"):
-                rel = elem.find("ObjectRelation")
-                if rel is not None:
-                    cad_nr = rel.findtext("ObjectCadastreNr")
-                    addr_data = elem.find("AddressData")
-                    if cad_nr and addr_data is not None:
-                        batch.append((normalize_id(cad_nr), format_lv_address(addr_data)))
+            if local_name(elem.tag) == "AddressItemData":
+                rel = find_child(elem, "ObjectRelation")
+                addr_data = find_child(elem, "AddressData")
+
+                if rel is not None and addr_data is not None:
+                    cad_nr = find_text(rel, "ObjectCadastreNr")
+                    if cad_nr:
+                        address = format_lv_address(addr_data)
+                        batch.append((normalize_id(cad_nr), address))
+
                 elem.clear()
+
                 if len(batch) >= 10000:
-                    conn.executemany("INSERT OR REPLACE INTO addresses (cid, address) VALUES (?, ?)", batch)
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO addresses (cid, address) VALUES (?, ?)",
+                        batch
+                    )
                     batch = []
+
         if batch:
-            conn.executemany("INSERT OR REPLACE INTO addresses (cid, address) VALUES (?, ?)", batch)
+            conn.executemany(
+                "INSERT OR REPLACE INTO addresses (cid, address) VALUES (?, ?)",
+                batch
+            )
         conn.commit()
-    except: pass
+
+    except Exception as e:
+        print(f"Address parse error in {xml_path}: {e}")
 
 def parse_land_xml(xml_path, conn):
+    """
+    Parse Dataset 3: Parcels / land units.
+
+    VZD specification:
+    - ParcelBasicData contains ParcelCadastreNr, ATVKCode, ParcelArea, ParcelLizValue.
+    - LandPurposeList/LandPurposeData contains LandPurposeKindId and LandPurposeArea.
+
+    Namespace-safe implementation.
+    """
     batch = []
     try:
         context = ET.iterparse(xml_path, events=("end",))
         for event, elem in context:
-            if elem.tag.endswith("ParcelItemData"):
-                basic = elem.find("ParcelBasicData")
+            if local_name(elem.tag) == "ParcelItemData":
+                basic = find_child(elem, "ParcelBasicData")
+
                 if basic is not None:
-                    cad_nr = basic.findtext("ParcelCadastreNr")
+                    cad_nr = find_text(basic, "ParcelCadastreNr")
                     if cad_nr:
                         cid = normalize_id(cad_nr)
                         purposes = []
-                        p_list = elem.find("LandPurposeList")
-                        if p_list is not None:
-                            for p_data in p_list.findall("LandPurposeData"):
-                                kind = p_data.find("LandPurposeKind")
-                                code = (kind.findtext("LandPurposeKindId") or "?").strip() if kind is not None else "?"
-                                area = float(p_data.findtext("LandPurposeArea") or 0.0)
-                                purposes.append((code, area))
+
+                        p_list = find_child(elem, "LandPurposeList")
+                        for p_data in find_children(p_list, "LandPurposeData"):
+                            kind = find_child(p_data, "LandPurposeKind")
+                            code = find_text(kind, "LandPurposeKindId", "?")
+                            try:
+                                area = float(find_text(p_data, "LandPurposeArea", "0") or 0.0)
+                            except Exception:
+                                area = 0.0
+                            purposes.append((code, area))
+
                         purposes.sort(key=lambda x: (-x[1], x[0]))
+
+                        try:
+                            parcel_area = float(find_text(basic, "ParcelArea", "0") or 0.0)
+                        except Exception:
+                            parcel_area = 0.0
+
+                        try:
+                            liz_qual = float(find_text(basic, "ParcelLizValue", "0") or 0.0)
+                        except Exception:
+                            liz_qual = 0.0
+
                         batch.append((
                             cid,
-                            (basic.findtext("ATVKCode") or "").strip(),
-                            float(basic.findtext("ParcelArea") or 0.0),
+                            find_text(basic, "ATVKCode"),
+                            parcel_area,
                             purposes[0][0] if purposes else "",
                             purposes[0][1] if purposes else 0.0,
                             ";".join([p[0] for p in purposes]),
                             ";".join([str(int(p[1])) for p in purposes]),
-                            float(basic.findtext("ParcelLizValue") or 0.0)
+                            liz_qual
                         ))
+
                 elem.clear()
+
                 if len(batch) >= 10000:
-                    conn.executemany("INSERT OR REPLACE INTO land (cid, atvk, par_area, purl_max, p_area_max, purl_lst, p_area_lst, liz_qual) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", batch)
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO land "
+                        "(cid, atvk, par_area, purl_max, p_area_max, purl_lst, p_area_lst, liz_qual) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        batch
+                    )
                     batch = []
+
         if batch:
-            conn.executemany("INSERT OR REPLACE INTO land (cid, atvk, par_area, purl_max, p_area_max, purl_lst, p_area_lst, liz_qual) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", batch)
+            conn.executemany(
+                "INSERT OR REPLACE INTO land "
+                "(cid, atvk, par_area, purl_max, p_area_max, purl_lst, p_area_lst, liz_qual) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                batch
+            )
         conn.commit()
-    except: pass
+
+    except Exception as e:
+        print(f"Land parse error in {xml_path}: {e}")
 
 def parse_building_xml(xml_path, conn):
     batch = []
@@ -429,61 +570,104 @@ def parse_building_xml(xml_path, conn):
     except Exception as e: pass
 
 def parse_property_xml(xml_path, conn):
+    """
+    Parse Dataset 1: Real estate properties.
+
+    VZD specification:
+    - CadastreObjectIdData/ProCadastreNr = property cadastre number.
+    - PropertyBasicData/PropertyName = property name.
+    - PropertyContentData/ObjectList/ObjectData/ObjectCadastreNrData = objects belonging to the property.
+
+    This table is critical because parcels/buildings are linked to property cadastre numbers
+    through PropertyContentData. Ownership data may then be joined via property cadastre number.
+
+    Namespace-safe implementation.
+    """
     batch = []
     try:
         context = ET.iterparse(xml_path, events=("end",))
         for event, elem in context:
-            if elem.tag.endswith("PropertyItemData"):
-                cad_obj_data = elem.find("CadastreObjectIdData")
-                pro_cad_nr = (cad_obj_data.findtext("ProCadastreNr") or "").strip() if cad_obj_data is not None else None
-                basic_data = elem.find("PropertyBasicData")
-                pro_name = (basic_data.findtext("PropertyName") or "").strip() if basic_data is not None else None
+            if local_name(elem.tag) == "PropertyItemData":
+                cad_obj_data = find_child(elem, "CadastreObjectIdData")
+                pro_cad_nr = find_text(cad_obj_data, "ProCadastreNr")
+
+                basic_data = find_child(elem, "PropertyBasicData")
+                pro_name = find_text(basic_data, "PropertyName")
 
                 if pro_cad_nr:
-                    content_data = elem.find("PropertyContentData")
-                    if content_data is not None:
-                        obj_list = content_data.find("ObjectList")
-                        if obj_list is not None:
-                            for obj_data in obj_list.findall("ObjectData"):
-                                obj_cad_nr = obj_data.findtext("ObjectCadastreNrData")
-                                if obj_cad_nr:
-                                    pid = normalize_id(obj_cad_nr)
-                                    batch.append((pid, pro_cad_nr, pro_name))
+                    content_data = find_child(elem, "PropertyContentData")
+                    obj_list = find_child(content_data, "ObjectList")
+
+                    for obj_data in find_children(obj_list, "ObjectData"):
+                        obj_cad_nr = find_text(obj_data, "ObjectCadastreNrData")
+                        if obj_cad_nr:
+                            batch.append((normalize_id(obj_cad_nr), pro_cad_nr, pro_name))
+
                 elem.clear()
+
                 if len(batch) >= 10000:
-                    conn.executemany("INSERT INTO properties (cid, pro_cad_nr, pro_name) VALUES (?, ?, ?)", batch)
+                    conn.executemany(
+                        "INSERT INTO properties (cid, pro_cad_nr, pro_name) VALUES (?, ?, ?)",
+                        batch
+                    )
                     batch = []
+
         if batch:
-            conn.executemany("INSERT INTO properties (cid, pro_cad_nr, pro_name) VALUES (?, ?, ?)", batch)
+            conn.executemany(
+                "INSERT INTO properties (cid, pro_cad_nr, pro_name) VALUES (?, ?, ?)",
+                batch
+            )
         conn.commit()
-    except: pass
+
+    except Exception as e:
+        print(f"Property parse error in {xml_path}: {e}")
 
 def parse_ownership_xml(xml_path, conn):
+    """
+    Parse Dataset 2: Ownership.
+
+    VZD specification:
+    OwnershipItemData/ObjectRelation links ownership records to Property or Building.
+    OwnershipStatusKindList contains OwnershipStatus and PersonStatus.
+
+    Namespace-safe implementation.
+    """
     batch = []
     try:
         context = ET.iterparse(xml_path, events=("end",))
         for event, elem in context:
-            if elem.tag.endswith("OwnershipItemData"):
-                rel = elem.find("ObjectRelation")
-                if rel is not None:
-                    target_id = (rel.findtext("ObjectCadastreNr") or "").strip()
-                    if target_id:
-                        tid = normalize_id(target_id)
-                        status_list = elem.find("OwnershipStatusKindList")
-                        if status_list is not None:
-                            for kind in status_list.findall("OwnershipStatusKind"):
-                                o_stat = (kind.findtext("OwnershipStatus") or "").strip()
-                                p_stat = (kind.findtext("PersonStatus") or "").strip()
-                                if o_stat or p_stat:
-                                    batch.append((tid, o_stat, p_stat))
+            if local_name(elem.tag) == "OwnershipItemData":
+                rel = find_child(elem, "ObjectRelation")
+                target_id = find_text(rel, "ObjectCadastreNr")
+
+                if target_id:
+                    tid = normalize_id(target_id)
+                    status_list = find_child(elem, "OwnershipStatusKindList")
+
+                    for kind in find_children(status_list, "OwnershipStatusKind"):
+                        o_stat = find_text(kind, "OwnershipStatus")
+                        p_stat = find_text(kind, "PersonStatus")
+                        if o_stat or p_stat:
+                            batch.append((tid, o_stat, p_stat))
+
                 elem.clear()
+
                 if len(batch) >= 10000:
-                    conn.executemany("INSERT INTO ownership (cid, status, person) VALUES (?, ?, ?)", batch)
+                    conn.executemany(
+                        "INSERT INTO ownership (cid, status, person) VALUES (?, ?, ?)",
+                        batch
+                    )
                     batch = []
+
         if batch:
-            conn.executemany("INSERT INTO ownership (cid, status, person) VALUES (?, ?, ?)", batch)
+            conn.executemany(
+                "INSERT INTO ownership (cid, status, person) VALUES (?, ?, ?)",
+                batch
+            )
         conn.commit()
-    except: pass
+
+    except Exception as e:
+        print(f"Ownership parse error in {xml_path}: {e}")
 
 def get_ownership_info(db_conn, obj_id, prop_cads_list):
     if not db_conn: return "", ""
